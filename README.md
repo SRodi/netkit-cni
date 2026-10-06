@@ -205,6 +205,58 @@ host services.
 The return path is symmetric. There is no SNAT; the destination observes the
 source Pod IP.
 
+### Why traditional ClusterIP Services do not work
+
+The current route-leaking topology is intentionally useful for learning, but
+it is not compatible with the traditional kube-proxy iptables and conntrack
+Service implementation. This is a limitation of this CNI's extra transit
+netkit pair, not a general limitation of netkit or VRFs.
+
+For a Pod connecting to a ClusterIP, the packet walk begins as expected:
+
+1. the packet enters the node through the Pod's netkit;
+2. kube-proxy's iptables rules select an endpoint and DNAT the ClusterIP to its
+   Pod IP; and
+3. table 100 sends the translated packet through `nk-vrf-x` to `nk-main`.
+
+The third step is where this datapath differs fundamentally from a traditional
+veth-based path. A netkit pair forwards by reinjecting the packet on its peer
+and calls the kernel's `skb_scrub_packet()` helper. That scrubs packet metadata,
+including the attached netfilter conntrack association. When the already-DNATed
+packet re-enters the network stack on `nk-main`, netfilter can create a second
+conntrack flow for the endpoint tuple instead of continuing the original
+ClusterIP flow.
+
+A packet capture makes the failure visible. Given a client
+`10.244.1.5:36272`, Service `10.96.234.175:80`, and endpoint
+`10.244.2.3:80`, the observed tuples are:
+
+```text
+Pod netkit in:   10.244.1.5:36272 -> 10.96.234.175:80
+transit out:     10.244.1.5:36272 -> 10.244.2.3:80    kube-proxy DNAT worked
+underlay out:    10.244.1.5:20703 -> 10.244.2.3:80    second conntrack flow
+underlay reply:  10.244.2.3:80    -> 10.244.1.5:20703
+Pod netkit out:  10.244.2.3:80    -> 10.244.1.5:36272 reverse DNAT missing
+```
+
+The backend is reachable and replies, but the client opened a connection to
+the ClusterIP and receives a SYN-ACK from the endpoint IP. It rejects that
+unexpected tuple with a TCP reset. UDP-based DNS fails for the same underlying
+reason: `kube-dns` is reached through a ClusterIP, so a DNS symptom does not
+mean that CoreDNS or CNI DNS configuration is broken.
+
+This is a useful boundary between routing and Kubernetes Services:
+
+- Pod-to-Pod routing can be correct while ClusterIP Services are broken;
+- successful endpoint DNAT does not prove that reverse NAT will work; and
+- a datapath that reinjects packets after DNAT must preserve or replace the
+  state on which the Service implementation depends.
+
+A future implementation must avoid the post-DNAT netkit reinjection or provide
+a Service implementation designed for this datapath, for example with BPF
+state instead of relying on kube-proxy's conntrack state. Changing CoreDNS or
+ordinary kube-proxy settings does not address the root cause.
+
 ## Build and test
 
 ```sh
@@ -250,7 +302,9 @@ tests both directions for both pairs. Each destination returns the TCP peer
 address it observed, and the script requires that value to equal the source
 Pod IP, proving that the tested flows were not SNATed. It also inspects netkit
 details, the VRF, protocol-98 node routes, table 100, protocol-99 Pod `/32`
-routes, and forwarding on all three nodes.
+routes, and forwarding on all three nodes. This test covers direct Pod IP
+connectivity only. It does not test ClusterIP Services or cluster DNS, which
+are known not to work with the current transit topology.
 
 ## Inspection
 
@@ -318,6 +372,9 @@ This project is deliberately non-production:
 - no NetworkPolicy or workload firewall;
 - no encryption, overlay, MTU discovery, or underlay capability detection;
 - no IPv6, dual stack, multiple IPs, bandwidth, port mappings, or DNS policy;
+- no kube-proxy ClusterIP Service compatibility: the transit netkit crossing
+  after DNAT scrubs the attached conntrack state needed for reverse NAT, which
+  also makes the `kube-dns` ClusterIP unusable;
 - no route ownership database beyond dedicated protocols 98 and 99;
 - no cleanup of orphaned host-local allocations after a hard node failure;
 - no collision recovery beyond a 48-bit truncated SHA-256 interface name;
