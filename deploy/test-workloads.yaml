@@ -1,0 +1,140 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: netkit-test
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: same-a
+  namespace: netkit-test
+  labels:
+    app: same-a
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: netkit-cni-worker
+  containers:
+    - name: server
+      image: python:3.13-alpine
+      command:
+        - python
+        - -u
+        - -c
+        - |
+          from http.server import BaseHTTPRequestHandler, HTTPServer
+          class Handler(BaseHTTPRequestHandler):
+              def do_GET(self):
+                  body = self.client_address[0].encode()
+                  self.send_response(200)
+                  self.send_header("Content-Length", str(len(body)))
+                  self.end_headers()
+                  self.wfile.write(body)
+              def log_message(self, format, *args):
+                  pass
+          HTTPServer(("0.0.0.0", 8080), Handler).serve_forever()
+      readinessProbe:
+        tcpSocket:
+          port: 8080
+        periodSeconds: 1
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: same-b
+  namespace: netkit-test
+  labels:
+    app: same-b
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: netkit-cni-worker
+  containers:
+    - name: server
+      image: python:3.13-alpine
+      command:
+        - python
+        - -u
+        - -c
+        - |
+          from http.server import BaseHTTPRequestHandler, HTTPServer
+          class Handler(BaseHTTPRequestHandler):
+              def do_GET(self):
+                  body = self.client_address[0].encode()
+                  self.send_response(200)
+                  self.send_header("Content-Length", str(len(body)))
+                  self.end_headers()
+                  self.wfile.write(body)
+              def log_message(self, format, *args):
+                  pass
+          HTTPServer(("0.0.0.0", 8080), Handler).serve_forever()
+      readinessProbe:
+        tcpSocket:
+          port: 8080
+        periodSeconds: 1
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: cross-a
+  namespace: netkit-test
+  labels:
+    app: cross-a
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: netkit-cni-worker
+  containers:
+    - name: server
+      image: python:3.13-alpine
+      command:
+        - python
+        - -u
+        - -c
+        - |
+          from http.server import BaseHTTPRequestHandler, HTTPServer
+          class Handler(BaseHTTPRequestHandler):
+              def do_GET(self):
+                  body = self.client_address[0].encode()
+                  self.send_response(200)
+                  self.send_header("Content-Length", str(len(body)))
+                  self.end_headers()
+                  self.wfile.write(body)
+              def log_message(self, format, *args):
+                  pass
+          HTTPServer(("0.0.0.0", 8080), Handler).serve_forever()
+      readinessProbe:
+        tcpSocket:
+          port: 8080
+        periodSeconds: 1
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: cross-b
+  namespace: netkit-test
+  labels:
+    app: cross-b
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: netkit-cni-worker2
+  containers:
+    - name: server
+      image: python:3.13-alpine
+      command:
+        - python
+        - -u
+        - -c
+        - |
+          from http.server import BaseHTTPRequestHandler, HTTPServer
+          class Handler(BaseHTTPRequestHandler):
+              def do_GET(self):
+                  body = self.client_address[0].encode()
+                  self.send_response(200)
+                  self.send_header("Content-Length", str(len(body)))
+                  self.end_headers()
+                  self.wfile.write(body)
+              def log_message(self, format, *args):
+                  pass
+          HTTPServer(("0.0.0.0", 8080), Handler).serve_forever()
+      readinessProbe:
+        tcpSocket:
+          port: 8080
+        periodSeconds: 1
