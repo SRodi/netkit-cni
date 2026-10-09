@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"path/filepath"
 
 	"github.com/srodi/netkit-cni/internal/plan"
 	"github.com/vishvananda/netlink"
@@ -15,15 +14,12 @@ import (
 )
 
 const (
-	TransitMainName = "nk-main"
-	TransitVRFName  = "nk-vrf-x"
 	PodRulePriority = 500
+	legacyMainName  = "nk-main"
+	legacyVRFName   = "nk-vrf-x"
 )
 
-var (
-	TransitMainAddress = mustCIDR("169.254.100.1/30")
-	TransitVRFAddress  = mustCIDR("169.254.100.2/30")
-)
+var VRFAddress = mustCIDR("169.254.100.1/32")
 
 type Reconciler struct {
 	VRFName  string
@@ -41,33 +37,27 @@ func (r Reconciler) Reconcile(localName string, nodes []plan.Node) error {
 	if err != nil {
 		return err
 	}
-	mainLink, vrfLink, err := ensureTransit(vrf)
+	if err := netlink.AddrReplace(vrf, &netlink.Addr{IPNet: VRFAddress}); err != nil {
+		return fmt.Errorf("assign node-local address to VRF %s: %w", r.VRFName, err)
+	}
+	if err := configureForwardingInterface(r.VRFName); err != nil {
+		return err
+	}
+	routePlan, err := plan.Build(localName, nodes)
 	if err != nil {
 		return err
 	}
-	if err := configureForwardingInterfaces(r.VRFName, TransitMainName, TransitVRFName); err != nil {
-		return err
-	}
-	clusterCIDR, err := plan.ClusterCIDR(nodes)
-	if err != nil {
-		return err
-	}
-	routePlan, err := plan.Build(localName, nodes, clusterCIDR, TransitMainName, TransitVRFName, r.VRFTable, TransitMainAddress.IP, TransitVRFAddress.IP)
-	if err != nil {
-		return err
-	}
-	links := map[string]netlink.Link{
-		TransitMainName: mainLink,
-		TransitVRFName:  vrfLink,
-	}
-	if err := reconcileRoutes(routePlan.Main, unix.RT_TABLE_MAIN, links); err != nil {
+	if err := reconcileRoutes(routePlan.Main, unix.RT_TABLE_MAIN); err != nil {
 		return fmt.Errorf("reconcile main routes: %w", err)
 	}
-	if err := reconcileRoutes(routePlan.VRF, r.VRFTable, links); err != nil {
-		return fmt.Errorf("reconcile VRF routes: %w", err)
+	if err := reconcileRoutes(nil, r.VRFTable); err != nil {
+		return fmt.Errorf("remove obsolete VRF routes: %w", err)
 	}
 	if err := reconcilePodRule(routePlan.LocalPodCIDR, r.VRFTable); err != nil {
 		return fmt.Errorf("reconcile local PodCIDR policy rule: %w", err)
+	}
+	if err := removeLegacyTransit(); err != nil {
+		return err
 	}
 	return nil
 }
@@ -98,62 +88,7 @@ func ensureVRF(name string, table int) (netlink.Link, error) {
 	return link, nil
 }
 
-func ensureTransit(vrf netlink.Link) (netlink.Link, netlink.Link, error) {
-	mainLink, mainErr := netlink.LinkByName(TransitMainName)
-	vrfLink, vrfErr := netlink.LinkByName(TransitVRFName)
-	if mainErr != nil || vrfErr != nil {
-		var mainMissing, vrfMissing netlink.LinkNotFoundError
-		if !(errors.As(mainErr, &mainMissing) && errors.As(vrfErr, &vrfMissing)) {
-			return nil, nil, fmt.Errorf("transit pair is incomplete or inaccessible: %s: %v, %s: %v", TransitMainName, mainErr, TransitVRFName, vrfErr)
-		}
-		netkit := &netlink.Netkit{
-			LinkAttrs:  netlink.LinkAttrs{Name: TransitMainName},
-			Mode:       netlink.NETKIT_MODE_L3,
-			Policy:     netlink.NETKIT_POLICY_FORWARD,
-			PeerPolicy: netlink.NETKIT_POLICY_FORWARD,
-		}
-		netkit.SetPeerAttrs(&netlink.LinkAttrs{Name: TransitVRFName})
-		if err := netlink.LinkAdd(netkit); err != nil {
-			return nil, nil, fmt.Errorf("create L3 netkit transit pair: %w", err)
-		}
-		mainLink, _ = netlink.LinkByName(TransitMainName)
-		vrfLink, _ = netlink.LinkByName(TransitVRFName)
-	}
-	mainNetkit, mainOK := mainLink.(*netlink.Netkit)
-	vrfNetkit, vrfOK := vrfLink.(*netlink.Netkit)
-	if !mainOK || !vrfOK || !mainNetkit.IsPrimary() || vrfNetkit.IsPrimary() ||
-		mainNetkit.Mode != netlink.NETKIT_MODE_L3 ||
-		vrfNetkit.Mode != netlink.NETKIT_MODE_L3 ||
-		mainNetkit.Policy != netlink.NETKIT_POLICY_FORWARD ||
-		mainNetkit.PeerPolicy != netlink.NETKIT_POLICY_FORWARD ||
-		vrfNetkit.Policy != netlink.NETKIT_POLICY_FORWARD ||
-		vrfNetkit.PeerPolicy != netlink.NETKIT_POLICY_FORWARD ||
-		mainLink.Attrs().ParentIndex != vrfLink.Attrs().Index ||
-		vrfLink.Attrs().ParentIndex != mainLink.Attrs().Index {
-		return nil, nil, fmt.Errorf("existing transit links are not an L3 netkit pair with FORWARD policy")
-	}
-	if vrfLink.Attrs().MasterIndex != 0 && vrfLink.Attrs().MasterIndex != vrf.Attrs().Index {
-		return nil, nil, fmt.Errorf("%s is enslaved to an unexpected master index %d", TransitVRFName, vrfLink.Attrs().MasterIndex)
-	}
-	if err := netlink.LinkSetMaster(vrfLink, vrf); err != nil {
-		return nil, nil, fmt.Errorf("enslave %s to %s: %w", TransitVRFName, vrf.Attrs().Name, err)
-	}
-	if err := netlink.AddrReplace(mainLink, &netlink.Addr{IPNet: TransitMainAddress}); err != nil {
-		return nil, nil, fmt.Errorf("assign transit address to %s: %w", TransitMainName, err)
-	}
-	if err := netlink.AddrReplace(vrfLink, &netlink.Addr{IPNet: TransitVRFAddress}); err != nil {
-		return nil, nil, fmt.Errorf("assign transit address to %s: %w", TransitVRFName, err)
-	}
-	if err := netlink.LinkSetUp(mainLink); err != nil {
-		return nil, nil, fmt.Errorf("set %s up: %w", TransitMainName, err)
-	}
-	if err := netlink.LinkSetUp(vrfLink); err != nil {
-		return nil, nil, fmt.Errorf("set %s up: %w", TransitVRFName, err)
-	}
-	return mainLink, vrfLink, nil
-}
-
-func reconcileRoutes(desired []plan.Route, table int, links map[string]netlink.Link) error {
+func reconcileRoutes(desired []plan.Route, table int) error {
 	wanted := make(map[string]netlink.Route, len(desired))
 	for _, route := range desired {
 		nlRoute := netlink.Route{
@@ -162,14 +97,7 @@ func reconcileRoutes(desired []plan.Route, table int, links map[string]netlink.L
 			Table:    table,
 			Protocol: netlink.RouteProtocol(route.Protocol),
 		}
-		if route.Device != "" {
-			link, ok := links[route.Device]
-			if !ok {
-				return fmt.Errorf("route %s references unknown device %s", route.Destination, route.Device)
-			}
-			nlRoute.LinkIndex = link.Attrs().Index
-			nlRoute.Scope = netlink.SCOPE_LINK
-		} else if route.Gateway != nil {
+		if route.Gateway != nil {
 			resolved, err := netlink.RouteGet(route.Gateway)
 			if err != nil || len(resolved) == 0 || resolved[0].LinkIndex == 0 {
 				return fmt.Errorf("resolve route to gateway %s: %w", route.Gateway, err)
@@ -198,6 +126,26 @@ func reconcileRoutes(desired []plan.Route, table int, links map[string]netlink.L
 		copy := route
 		if err := netlink.RouteReplace(&copy); err != nil {
 			return fmt.Errorf("replace route %s in table %d: %w", route.Dst, table, err)
+		}
+	}
+	return nil
+}
+
+func removeLegacyTransit() error {
+	for _, name := range []string{legacyMainName, legacyVRFName} {
+		link, err := netlink.LinkByName(name)
+		if err != nil {
+			var notFound netlink.LinkNotFoundError
+			if errors.As(err, &notFound) {
+				continue
+			}
+			return fmt.Errorf("look up obsolete transit link %s: %w", name, err)
+		}
+		if _, ok := link.(*netlink.Netkit); !ok {
+			return fmt.Errorf("obsolete transit name %s is occupied by a non-netkit link", name)
+		}
+		if err := netlink.LinkDel(link); err != nil {
+			return fmt.Errorf("delete obsolete transit link %s: %w", name, err)
 		}
 	}
 	return nil
@@ -266,13 +214,11 @@ func enableForwarding() error {
 	return nil
 }
 
-func configureForwardingInterfaces(names ...string) error {
-	for _, name := range names {
-		for setting, value := range map[string]string{"forwarding": "1\n", "rp_filter": "0\n"} {
-			path := filepath.Join("/proc/sys/net/ipv4/conf", name, setting)
-			if err := os.WriteFile(path, []byte(value), 0o644); err != nil {
-				return fmt.Errorf("write sysctl %s: %w", path, err)
-			}
+func configureForwardingInterface(name string) error {
+	for setting, value := range map[string]string{"forwarding": "1\n", "rp_filter": "0\n"} {
+		path := fmt.Sprintf("/proc/sys/net/ipv4/conf/%s/%s", name, setting)
+		if err := os.WriteFile(path, []byte(value), 0o644); err != nil {
+			return fmt.Errorf("write sysctl %s: %w", path, err)
 		}
 	}
 	return nil

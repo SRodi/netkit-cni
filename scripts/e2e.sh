@@ -42,6 +42,53 @@ assert_source_ip same-b same-a
 assert_source_ip cross-a cross-b
 assert_source_ip cross-b cross-a
 
+request() {
+  local pod=$1
+  local url=$2
+  local output
+  for _ in $(seq 1 20); do
+    if output=$(kubectl --context "${CONTEXT}" -n "${NS}" exec "${pod}" -- \
+      python -c "import urllib.request; print(urllib.request.urlopen('${url}', timeout=3).read().decode())" 2>/dev/null); then
+      printf '%s' "${output}"
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+assert_service_source() {
+  local source=$1
+  local service=$2
+  local source_ip observed
+  current_step="checking Service ${service} from ${source}"
+  source_ip=$(pod_ip "${source}")
+  observed=$(request "${source}" "http://${service}.${NS}.svc.cluster.local")
+  if [[ "${observed}" != "${source_ip}" ]]; then
+    echo "${source} -> ${service}: destination observed ${observed}, want ${source_ip}" >&2
+    exit 1
+  fi
+  echo "PASS ${source} -> ${service}; DNS, ClusterIP, and source preservation"
+}
+
+assert_service_source same-a same-service
+assert_service_source same-a cross-service
+
+current_step="checking headless Service DNS and connectivity"
+cross_b_ip=$(pod_ip cross-b)
+headless_ip=$(kubectl --context "${CONTEXT}" -n "${NS}" exec same-a -- \
+  python -c "import socket; print(socket.gethostbyname('cross-headless.${NS}.svc.cluster.local'))")
+if [[ "${headless_ip}" != "${cross_b_ip}" ]]; then
+  echo "headless Service resolved to ${headless_ip}, want ${cross_b_ip}" >&2
+  exit 1
+fi
+headless_observed=$(request same-a "http://cross-headless.${NS}.svc.cluster.local:8080")
+if [[ "${headless_observed}" != "$(pod_ip same-a)" ]]; then
+  echo "headless Service endpoint observed ${headless_observed}, want $(pod_ip same-a)" >&2
+  exit 1
+fi
+echo "PASS headless Service DNS and direct endpoint connectivity"
+
 for node in "${CLUSTER}-control-plane" "${CLUSTER}-worker" "${CLUSTER}-worker2"; do
   current_step="inspecting ${node}"
   echo "=== ${node}: netkit ==="
@@ -52,15 +99,18 @@ for node in "${CLUSTER}-control-plane" "${CLUSTER}-worker" "${CLUSTER}-worker2";
   docker exec "${node}" ip -4 route show table main proto 98
   echo "=== ${node}: VRF table 100 ==="
   docker exec "${node}" ip -4 route show table 100
-  docker exec "${node}" sh -ec "ip -details link show nk-main | grep -q 'netkit mode l3'"
-  docker exec "${node}" sh -ec "ip -details link show nk-vrf-x | grep -q 'netkit mode l3'"
   docker exec "${node}" sh -ec "ip -details link show nk-vrf | grep -q 'vrf table 100'"
+  docker exec "${node}" sh -ec "ip -o -4 address show dev nk-vrf | grep -Fq '169.254.100.1/32'"
+  docker exec "${node}" sh -ec "! ip link show nk-main >/dev/null 2>&1"
+  docker exec "${node}" sh -ec "! ip link show nk-vrf-x >/dev/null 2>&1"
+  docker exec "${node}" sh -ec "test -z \"\$(ip -4 route show table 100 proto 98)\""
   docker exec "${node}" sh -ec "test \"\$(cat /proc/sys/net/ipv4/ip_forward)\" = 1"
   docker exec "${node}" sh -ec "test \"\$(cat /proc/sys/net/ipv4/tcp_l3mdev_accept)\" = 1"
   docker exec "${node}" sh -ec "test \"\$(cat /proc/sys/net/ipv4/udp_l3mdev_accept)\" = 1"
 
   pod_cidr=$(kubectl --context "${CONTEXT}" get node "${node}" -o jsonpath='{.spec.podCIDR}')
   docker exec "${node}" sh -ec "ip -4 rule show | grep -Fq 'to ${pod_cidr} lookup 100'"
+  docker exec "${node}" sh -ec "test -z \"\$(ip -4 route show table main proto 98 ${pod_cidr})\""
 done
 
 for node in "${CLUSTER}-worker" "${CLUSTER}-worker2"; do
@@ -69,4 +119,4 @@ for node in "${CLUSTER}-worker" "${CLUSTER}-worker2"; do
     "routes=\$(ip -o -4 route show table 100 proto 99); test -n \"\${routes}\"; printf '%s\n' \"\${routes}\" | awk '\$1 ~ /\\// { found_non_host=1 } END { exit found_non_host }'"
 done
 
-echo "All same-node, cross-node, route, netkit, VRF, and no-SNAT checks passed."
+echo "All Pod, Service, DNS, route, netkit, VRF, and no-SNAT checks passed."

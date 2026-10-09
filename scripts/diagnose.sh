@@ -43,7 +43,7 @@ for node in "${CLUSTER}-control-plane" "${CLUSTER}-worker" "${CLUSTER}-worker2";
 
   section "${node}: forwarding state"
   docker exec "${node}" sh -c \
-    'for path in /proc/sys/net/ipv4/ip_forward /proc/sys/net/ipv4/tcp_l3mdev_accept /proc/sys/net/ipv4/udp_l3mdev_accept; do printf "%s=%s\n" "$path" "$(cat "$path")"; done; for dev in all default nk-main nk-vrf-x nk-vrf; do for setting in forwarding rp_filter; do path="/proc/sys/net/ipv4/conf/$dev/$setting"; test -e "$path" && printf "%s=%s\n" "$path" "$(cat "$path")"; done; done' \
+    'for path in /proc/sys/net/ipv4/ip_forward /proc/sys/net/ipv4/tcp_l3mdev_accept /proc/sys/net/ipv4/udp_l3mdev_accept; do printf "%s=%s\n" "$path" "$(cat "$path")"; done; for dev in all default nk-vrf; do for setting in forwarding rp_filter; do path="/proc/sys/net/ipv4/conf/$dev/$setting"; test -e "$path" && printf "%s=%s\n" "$path" "$(cat "$path")"; done; done' \
     2>&1 || true
 
   section "${node}: route lookups for test Pods"
