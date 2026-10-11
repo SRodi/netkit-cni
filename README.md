@@ -1,5 +1,7 @@
 # netkit-cni
 
+[![CI](https://github.com/srodi/netkit-cni/actions/workflows/ci.yml/badge.svg)](https://github.com/srodi/netkit-cni/actions/workflows/ci.yml)
+
 `netkit-cni` is an educational Kubernetes CNI that connects Pods with Linux
 **L3 netkit** devices and keeps local Pod routes in a Linux **VRF**. It uses
 ordinary Linux routing between nodes and works with kube-proxy Services.
@@ -170,6 +172,25 @@ The E2E test verifies:
 
 Run `make diagnose` to collect Pods, logs, links, routes, rules, sysctls, and
 route lookups when a test fails.
+
+## Run on an existing cluster
+
+Pushing a `v*` tag publishes `ghcr.io/srodi/netkit-cni:<version>` (linux/amd64
+only) through the `Image` workflow. The manifest uses a local
+`netkit-cni:dev` image, so override the image and pull policy when applying it:
+
+```sh
+VERSION=0.1.0
+sed -e "s|image: netkit-cni:dev|image: ghcr.io/srodi/netkit-cni:${VERSION}|" \
+    -e "s|imagePullPolicy: Never|imagePullPolicy: IfNotPresent|" \
+    deploy/netkit-cni.yaml | kubectl apply -f -
+```
+
+The cluster must meet the [prerequisites](#prerequisites): Nodes with kernel
+6.8+ and netkit and VRF support, allocated PodCIDRs, and no other CNI.
+Cross-node traffic works only where the underlay routes Pod CIDRs between
+Node InternalIPs, as described under Troubleshooting. This path has been
+tested only with kind.
 
 ## Inspect a node
 

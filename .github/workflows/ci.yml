@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Test, vet, and build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: make check
+      - run: make build
+      - run: make image
+
+  e2e:
+    name: Integration and kind E2E
+    runs-on: ubuntu-24.04
+    needs: check
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      # The runner kernel must provide netkit and VRF. The check creates real
+      # devices, so a failure here means the runner cannot run the E2E steps.
+      - name: Check kernel prerequisites
+        id: prerequisites
+        continue-on-error: true
+        run: make prerequisites
+      - name: Report unsupported runner
+        if: steps.prerequisites.outcome == 'failure'
+        run: echo "::warning::Runner kernel $(uname -r) lacks netkit or VRF support; skipping integration and E2E."
+      - name: Integration
+        if: steps.prerequisites.outcome == 'success'
+        run: make integration
+      - name: Start kind cluster
+        if: steps.prerequisites.outcome == 'success'
+        run: make kind-up
+      - name: E2E
+        if: steps.prerequisites.outcome == 'success'
+        run: make e2e
+      - name: Diagnose
+        if: failure() && steps.prerequisites.outcome == 'success'
+        run: make diagnose
+      - name: Stop kind cluster
+        if: always() && steps.prerequisites.outcome == 'success'
+        run: make kind-down
