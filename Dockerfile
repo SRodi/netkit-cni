@@ -10,6 +10,6 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/netkit-cni ./cmd/n
  && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/host-local github.com/containernetworking/plugins/plugins/ipam/host-local
 
 FROM alpine:3.22
-RUN apk add --no-cache ca-certificates
+RUN apk add --no-cache ca-certificates iptables
 COPY --from=builder /out /out
 ENTRYPOINT ["/out/netkit-agent"]

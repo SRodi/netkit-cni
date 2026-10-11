@@ -12,7 +12,7 @@ func NodesFromAPI(items []corev1.Node) ([]plan.Node, error) {
 	nodes := make([]plan.Node, 0, len(items))
 	for _, item := range items {
 		if item.Spec.PodCIDR == "" {
-			return nil, fmt.Errorf("node %s has no PodCIDR", item.Name)
+			return nil, fmt.Errorf("node %s has no PodCIDR; assign one as described under \"Assign PodCIDRs\" in the README", item.Name)
 		}
 		ip, podCIDR, err := net.ParseCIDR(item.Spec.PodCIDR)
 		if err != nil || ip.To4() == nil {

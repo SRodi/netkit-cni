@@ -35,9 +35,10 @@ PodCIDR. Every node assigns `169.254.100.1/32` to its VRF so host-originated
 connections, including kubelet probes, have a valid source address. The
 address is node-local and is never routed between nodes.
 
-There is no bridge, overlay, per-Pod veth, synthetic gateway, or project-owned
-NAT. Both ends of every netkit pair use the kernel's `forward` policy; this
-project attaches no BPF program.
+There is no bridge, overlay, per-Pod veth, or synthetic gateway. Both ends of
+every netkit pair use the kernel's `forward` policy; this project attaches no
+BPF program. The agent masquerades Pod traffic leaving all known PodCIDRs so
+routed clouds and other underlays see the node IP as the source.
 
 ## Route selection
 
@@ -73,11 +74,13 @@ This gives the important paths:
   local `/32`;
 - **ClusterIP:** kube-proxy translates the Service address before routing;
   the selected endpoint then follows the same local or remote path;
-- **external destination:** table 100 misses and the node's main default route
-  applies.
+- **external destination:** table 100 misses, the node's main default route
+  applies, and `NETKIT-CNI-EGRESS` masquerades the packet;
 
 The VRF organizes local Pod routes; it is not a security boundary. Network
-policy and egress masquerading are outside this project.
+policy remains outside this project. Egress masquerading deliberately excludes
+every PodCIDR reported by the Kubernetes API, preserving Pod source addresses
+for same-node and cross-node traffic.
 
 ## Components
 
@@ -105,6 +108,7 @@ The privileged, host-networked DaemonSet:
 - assigns its node-local host source address;
 - installs remote PodCIDR routes in `main`;
 - installs the local-PodCIDR rule for table 100;
+- reconciles the `NETKIT-CNI-EGRESS` chain for external-traffic masquerading;
 - enables forwarding, disables reverse-path filtering, and enables the TCP
   and UDP l3mdev socket settings needed by host services;
 - writes the node-specific CNI configuration atomically; and
@@ -114,6 +118,10 @@ Route protocols separate ownership:
 
 - protocol 98: remote PodCIDR routes owned by the agent;
 - protocol 99: local Pod `/32` routes owned by the CNI.
+
+The agent also owns one jump from the `nat` table's `POSTROUTING` chain to
+`NETKIT-CNI-EGRESS`. The chain returns traffic destined for any known PodCIDR
+unchanged and masquerades other traffic sourced from the local PodCIDR.
 
 ## Prerequisites
 
@@ -192,6 +200,52 @@ Cross-node traffic works only where the underlay routes Pod CIDRs between
 Node InternalIPs, as described under Troubleshooting. This path has been
 tested only with kind.
 
+### Assign PodCIDRs
+
+The agent requires every Node to have `spec.podCIDR`. kind and kubeadm get it
+from the controller manager. Some managed clusters, such as AKS with
+bring-your-own CNI, leave it empty, and the agent reports
+`node <name> has no PodCIDR`. Assign a disjoint range to each Node before
+installing the manifest, choosing a range that does not overlap the Node
+network or the Service CIDR:
+
+```sh
+for node in $(kubectl get nodes -o jsonpath='{.items[*].metadata.name}'); do
+  [ -n "$(kubectl get node "$node" -o jsonpath='{.spec.podCIDR}')" ] && continue
+  i=0
+  while kubectl get nodes -o jsonpath='{.items[*].spec.podCIDR}' | tr ' ' '\n' | grep -qx "10.244.$i.0/24"; do i=$((i+1)); done
+  kubectl patch node "$node" --type=merge \
+    -p "{\"spec\":{\"podCIDR\":\"10.244.$i.0/24\",\"podCIDRs\":[\"10.244.$i.0/24\"]}}"
+done
+```
+
+The loop skips Nodes that already have a PodCIDR, so run it again after
+adding Nodes. A PodCIDR cannot be changed once set. This only assigns
+addresses; it does not make the underlay route them between Nodes.
+
+### Route PodCIDRs on Azure
+
+Azure drops packets for addresses it does not know, so cross-node Pod traffic
+needs one user-defined route per Node PodCIDR, with the Node InternalIP as next
+hop. The Node NICs must also have IP forwarding enabled, which AKS does by
+default. This was verified on AKS with bring-your-own CNI:
+
+```sh
+NRG=<node resource group>   # az aks show -g <rg> -n <cluster> --query nodeResourceGroup -o tsv
+VNET=<virtual network>
+SUBNET=<node subnet>
+az network route-table create -g "$NRG" -n netkit-cni-pods
+az network route-table route create -g "$NRG" --route-table-name netkit-cni-pods \
+  -n node0 --address-prefix 10.244.0.0/24 \
+  --next-hop-type VirtualAppliance --next-hop-ip-address <node 0 InternalIP>
+# repeat for each Node, then attach the table:
+az network vnet subnet update -g "$NRG" --vnet-name "$VNET" -n "$SUBNET" \
+  --route-table netkit-cni-pods
+```
+
+Add a route whenever you add a Node. To undo, detach the table from the subnet
+and delete it.
+
 ## Inspect a node
 
 ```sh
@@ -249,6 +303,19 @@ Verify that:
 The project does not distribute routes outside Kubernetes nodes. Real
 networks may need BGP, cloud routes, static routes, or an overlay.
 
+### Pods cannot reach external addresses
+
+Inspect the agent-owned masquerade chain:
+
+```sh
+iptables -t nat -S NETKIT-CNI-EGRESS
+iptables -t nat -C POSTROUTING -j NETKIT-CNI-EGRESS
+```
+
+The chain must return traffic to every Node PodCIDR before its final
+`MASQUERADE` rule for the local PodCIDR. Check the agent logs if the chain is
+missing or stale.
+
 ### Host services cannot reach Pods
 
 Linux scopes sockets by VRF. The agent enables `tcp_l3mdev_accept` and
@@ -277,7 +344,8 @@ has:
 - no Service implementation of its own; it relies on kube-proxy;
 - no distributed IPAM or route-distribution protocol;
 - no comprehensive crash recovery, upgrade framework, or orphaned-IP cleanup;
-- a privileged agent that can modify host networking and CNI files; and
+- a privileged agent that can modify host networking, iptables, and CNI files;
+  and
 - unencapsulated Pod traffic that the underlay must route and permit.
 
 ## References

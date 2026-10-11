@@ -5,6 +5,7 @@ go 1.26.0
 require (
 	github.com/containernetworking/cni v1.3.1
 	github.com/containernetworking/plugins v1.9.1
+	github.com/coreos/go-iptables v0.8.0
 	github.com/vishvananda/netlink v1.3.1
 	golang.org/x/sys v0.47.0
 	k8s.io/api v0.37.1
@@ -13,7 +14,6 @@ require (
 )
 
 require (
-	github.com/coreos/go-iptables v0.8.0 // indirect
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
 	github.com/emicklei/go-restful/v3 v3.13.0 // indirect
 	github.com/fxamacker/cbor/v2 v2.9.1 // indirect

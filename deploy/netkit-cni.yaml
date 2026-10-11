@@ -44,7 +44,7 @@ spec:
     spec:
       serviceAccountName: netkit-agent
       hostNetwork: true
-      dnsPolicy: ClusterFirstWithHostNet
+      dnsPolicy: Default
       tolerations:
         - operator: Exists
       initContainers:

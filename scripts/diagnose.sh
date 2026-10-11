@@ -46,6 +46,10 @@ for node in "${CLUSTER}-control-plane" "${CLUSTER}-worker" "${CLUSTER}-worker2";
     'for path in /proc/sys/net/ipv4/ip_forward /proc/sys/net/ipv4/tcp_l3mdev_accept /proc/sys/net/ipv4/udp_l3mdev_accept; do printf "%s=%s\n" "$path" "$(cat "$path")"; done; for dev in all default nk-vrf; do for setting in forwarding rp_filter; do path="/proc/sys/net/ipv4/conf/$dev/$setting"; test -e "$path" && printf "%s=%s\n" "$path" "$(cat "$path")"; done; done' \
     2>&1 || true
 
+  section "${node}: egress masquerading"
+  docker exec "${node}" iptables -t nat -S NETKIT-CNI-EGRESS 2>&1 || true
+  docker exec "${node}" iptables -t nat -C POSTROUTING -j NETKIT-CNI-EGRESS 2>&1 || true
+
   section "${node}: route lookups for test Pods"
   for pod in same-a same-b cross-a cross-b; do
     pod_ip=$(kubectl --context "${CONTEXT}" -n "${NS}" get pod "${pod}" -o jsonpath='{.status.podIP}' 2>/dev/null)

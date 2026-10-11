@@ -111,6 +111,13 @@ for node in "${CLUSTER}-control-plane" "${CLUSTER}-worker" "${CLUSTER}-worker2";
   pod_cidr=$(kubectl --context "${CONTEXT}" get node "${node}" -o jsonpath='{.spec.podCIDR}')
   docker exec "${node}" sh -ec "ip -4 rule show | grep -Fq 'to ${pod_cidr} lookup 100'"
   docker exec "${node}" sh -ec "test -z \"\$(ip -4 route show table main proto 98 ${pod_cidr})\""
+  docker exec "${node}" iptables -t nat -C POSTROUTING -j NETKIT-CNI-EGRESS
+  for destination_cidr in $(kubectl --context "${CONTEXT}" get nodes -o jsonpath='{range .items[*]}{.spec.podCIDR}{"\n"}{end}'); do
+    docker exec "${node}" iptables -t nat -C NETKIT-CNI-EGRESS \
+      -s "${pod_cidr}" -d "${destination_cidr}" -j RETURN
+  done
+  docker exec "${node}" iptables -t nat -C NETKIT-CNI-EGRESS \
+    -s "${pod_cidr}" -j MASQUERADE
 done
 
 for node in "${CLUSTER}-worker" "${CLUSTER}-worker2"; do
@@ -119,4 +126,4 @@ for node in "${CLUSTER}-worker" "${CLUSTER}-worker2"; do
     "routes=\$(ip -o -4 route show table 100 proto 99); test -n \"\${routes}\"; printf '%s\n' \"\${routes}\" | awk '\$1 ~ /\\// { found_non_host=1 } END { exit found_non_host }'"
 done
 
-echo "All Pod, Service, DNS, route, netkit, VRF, and no-SNAT checks passed."
+echo "All Pod, Service, DNS, route, netkit, VRF, source-preservation, and egress-NAT checks passed."

@@ -7,19 +7,32 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"sort"
+	"strings"
 
+	"github.com/coreos/go-iptables/iptables"
 	"github.com/srodi/netkit-cni/internal/plan"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 )
 
 const (
-	PodRulePriority = 500
-	legacyMainName  = "nk-main"
-	legacyVRFName   = "nk-vrf-x"
+	PodRulePriority       = 500
+	masqueradeChain       = "NETKIT-CNI-EGRESS"
+	masqueradeTable       = "nat"
+	masqueradeParentChain = "POSTROUTING"
+	legacyMainName        = "nk-main"
+	legacyVRFName         = "nk-vrf-x"
 )
 
 var VRFAddress = mustCIDR("169.254.100.1/32")
+
+type iptablesClient interface {
+	Append(table, chain string, rulespec ...string) error
+	AppendUnique(table, chain string, rulespec ...string) error
+	ClearChain(table, chain string) error
+	List(table, chain string) ([]string, error)
+}
 
 type Reconciler struct {
 	VRFName  string
@@ -56,10 +69,73 @@ func (r Reconciler) Reconcile(localName string, nodes []plan.Node) error {
 	if err := reconcilePodRule(routePlan.LocalPodCIDR, r.VRFTable); err != nil {
 		return fmt.Errorf("reconcile local PodCIDR policy rule: %w", err)
 	}
+	ipt, err := iptables.New(iptables.Timeout(5))
+	if err != nil {
+		return fmt.Errorf("initialize iptables: %w", err)
+	}
+	if err := reconcileMasquerade(ipt, routePlan.LocalPodCIDR, nodes); err != nil {
+		return err
+	}
 	if err := removeLegacyTransit(); err != nil {
 		return err
 	}
 	return nil
+}
+
+func reconcileMasquerade(ipt iptablesClient, localPodCIDR *net.IPNet, nodes []plan.Node) error {
+	if localPodCIDR == nil {
+		return fmt.Errorf("local PodCIDR is required for egress masquerading")
+	}
+	podCIDRs := make([]string, 0, len(nodes))
+	seen := make(map[string]struct{}, len(nodes))
+	for _, node := range nodes {
+		if node.PodCIDR == nil || node.PodCIDR.IP.To4() == nil {
+			return fmt.Errorf("node %s has invalid IPv4 PodCIDR for egress masquerading", node.Name)
+		}
+		cidr := node.PodCIDR.String()
+		if _, ok := seen[cidr]; ok {
+			continue
+		}
+		seen[cidr] = struct{}{}
+		podCIDRs = append(podCIDRs, cidr)
+	}
+	sort.Strings(podCIDRs)
+
+	localCIDR := localPodCIDR.String()
+	desired := make([][]string, 0, len(podCIDRs)+1)
+	for _, podCIDR := range podCIDRs {
+		desired = append(desired, []string{"-s", localCIDR, "-d", podCIDR, "-j", "RETURN"})
+	}
+	desired = append(desired, []string{"-s", localCIDR, "-j", "MASQUERADE"})
+
+	current, err := ipt.List(masqueradeTable, masqueradeChain)
+	if err != nil || !iptablesRulesEqual(current, desired) {
+		if err := ipt.ClearChain(masqueradeTable, masqueradeChain); err != nil {
+			return fmt.Errorf("clear egress masquerade chain: %w", err)
+		}
+		for _, rule := range desired {
+			if err := ipt.Append(masqueradeTable, masqueradeChain, rule...); err != nil {
+				return fmt.Errorf("append egress masquerade rule %v: %w", rule, err)
+			}
+		}
+	}
+	if err := ipt.AppendUnique(masqueradeTable, masqueradeParentChain, "-j", masqueradeChain); err != nil {
+		return fmt.Errorf("attach egress masquerade chain: %w", err)
+	}
+	return nil
+}
+
+func iptablesRulesEqual(current []string, desired [][]string) bool {
+	if len(current) != len(desired)+1 || current[0] != "-N "+masqueradeChain {
+		return false
+	}
+	for i, rule := range desired {
+		want := "-A " + masqueradeChain + " " + strings.Join(rule, " ")
+		if current[i+1] != want {
+			return false
+		}
+	}
+	return true
 }
 
 func ensureVRF(name string, table int) (netlink.Link, error) {
